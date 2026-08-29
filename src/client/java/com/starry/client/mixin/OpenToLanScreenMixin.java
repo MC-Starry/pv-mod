@@ -1,7 +1,10 @@
 package com.starry.client.mixin;
 
 import com.starry.client.PlayVanillaState;
+import net.minecraft.client.gui.Element;
 import net.minecraft.client.gui.screen.OpenToLanScreen;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.widget.CyclingButtonWidget;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
@@ -14,10 +17,17 @@ public class OpenToLanScreenMixin {
     @Shadow
     private boolean allowCommands;
 
-    // 进入开局域网界面：作弊直接为关
+    // 进入开局域网界面：作弊强制关 + 把「允许作弊」按钮置灰
     @Inject(method = "init", at = @At("TAIL"))
     private void pv$lanCheatsOffInit(CallbackInfo ci) {
-        if (PlayVanillaState.forceHardcore) this.allowCommands = false;
+        if (!PlayVanillaState.forceHardcore) return;
+        this.allowCommands = false;
+        Screen self = (Screen) (Object) this;
+        for (Element element : self.children()) {
+            if (element instanceof CyclingButtonWidget<?> cb && cb.getValue() instanceof Boolean) {
+                cb.active = false;
+            }
+        }
     }
 
     // 真正执行 openToLan 之前：强制作弊为关（method_19851 = 开 LAN 的方法）

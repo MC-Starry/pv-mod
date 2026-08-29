@@ -5,7 +5,8 @@
   "client": [
     "CreateWorldScreenMixin",
     "OpenToLanScreenMixin",
-    "WorldCreatorMixin"
+    "WorldCreatorMixin",
+    "GameTabMixin"
   ],
   "injectors": {
     "defaultRequire": 1
