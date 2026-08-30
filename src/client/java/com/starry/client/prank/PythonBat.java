@@ -43,9 +43,9 @@ JetBrains IDE 全家桶 + Visual Studio + VS Code 自动下载与静默安装脚
     - Visual Studio
 
 用法:
-  python install_ides.py                 # 打开图形界面 (GUI)
+  python install_ides.py                 # 打开图形界面 (GUI): 手动勾选后点「开始安装」
   python install_ides.py --gui           # 同上
-  python install_ides.py --gui --auto-start    # GUI 打开后自动全选 JetBrains + VS Code 并自动开始安装
+  python install_ides.py --gui --auto-start   # GUI 打开后自动全选全部产品并开始安装 (需显式传入)
   python install_ides.py --cli --all     # 命令行安装全部 JetBrains + VS Code
   python install_ides.py --cli --all --auto   # 命令行全自动静默安装
   python install_ides.py --list          # 列出所有产品
@@ -73,6 +73,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 # 统一标准输出编码为 UTF-8, 避免中文在 Windows 控制台乱码 (Python 3.7+)
@@ -136,6 +138,9 @@ VS_WORKLOADS = [
 # 默认 User-Agent, 部分下载地址对 UA 有要求
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
+# 网络请求最大重试次数 (国内 JetBrains CDN 间歇性返回 404, 多试几次更稳)
+DOWNLOAD_RETRIES = 6
+
 # ---------------------------------------------------------------------------
 # UI 桥接: 有 GUI 时指向 InstallerGUI 实例, 命令行模式为 None
 # ---------------------------------------------------------------------------
@@ -156,22 +161,106 @@ def log(msg):
   print(msg, flush=True)
 
 
-def download_file(url, dest_path, description="", progress_callback=None):
-  ""\"下载文件并显示进度, 支持断点续传保护 (.part 临时文件)。
+# ---------------------------------------------------------------------------
+# 网络层: 手动跟随重定向, 强制 Connection: keep-alive
+# 国内 JetBrains CDN (download-cdn.clf.jetbrains.com.cn) 对 urllib 默认的
+# Connection: close 会返回 HTTP 404, 必须显式 keep-alive 才能下载。
+# ---------------------------------------------------------------------------
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
-  progress_callback(done, total): 可选, 由调用方(如 GUI)实时获取下载进度。
-  有 GUI 时, 每读取一块会检测用户是否点击了取消。
-  网络异常会自动重试最多 3 次 (用户取消除外)。
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _open_keepalive(url, timeout):
+  ""\"打开 URL 并手动跟随重定向, 每一跳都强制 Connection: keep-alive。""\"
+  current = url
+  for _ in range(5):
+      req = urllib.request.Request(
+          current,
+          headers={"User-Agent": USER_AGENT, "Connection": "keep-alive"},
+      )
+      try:
+          return _NO_REDIRECT_OPENER.open(req, timeout=timeout)
+      except urllib.error.HTTPError as e:
+          if e.code in (301, 302, 303, 307, 308):
+              loc = e.headers.get("Location")
+              e.close()
+              if not loc:
+                  raise
+              current = (
+                  loc if loc.startswith("http")
+                  else urllib.parse.urljoin(current, loc)
+              )
+          else:
+              raise
+  raise RuntimeError("重定向次数过多, 请检查下载地址")
+
+
+def _fetch_json(url, timeout=30):
+  ""\"抓取 URL 并解析 JSON: 先试系统 curl (绕开 Windows 下 urllib 偶发的
+  [Errno 22] Invalid argument 与国内网络问题), 失败回退 urllib keep-alive。""\"
+  try:
+      out = subprocess.run(
+          ["curl", "-sS", "--fail", "--max-time", str(timeout),
+           "--retry", "3", "--retry-delay", "1",
+           "-A", USER_AGENT, url],
+          capture_output=True, text=True, encoding="utf-8",
+          errors="replace", check=True,
+      ).stdout
+      return json.loads(out)
+  except Exception:
+      with _open_keepalive(url, timeout) as resp:
+          return json.loads(resp.read().decode("utf-8"))
+
+
+def _download_with_curl(url, dest_path, description=""):
+  ""\"用系统自带 curl 下载 (绕开 urllib 与国内 CDN 的兼容问题)。
+
+  curl 自带重试, 是本脚本的默认下载方式; 进度显示在控制台 (stderr)。
   ""\"
-  req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
   tmp = dest_path + ".part"
-  for attempt in range(1, 4):
+  cmd = [
+      "curl", "-L", "--fail",
+      "--retry", "5", "--retry-delay", "1", "--retry-all-errors",
+      "-A", USER_AGENT,
+      "-o", tmp, url,
+  ]
+  log(f"[下载] 使用系统 curl 兜底下载 {description} ...")
+  subprocess.run(cmd, check=True)
+  os.replace(tmp, dest_path)
+  return dest_path
+
+
+def download_file(url, dest_path, description="", progress_callback=None):
+  ""\"下载文件, 优先使用系统 curl (国内 CDN 下最稳定, 自带重试);
+  curl 失败时回退 urllib 带进度条下载。
+
+  progress_callback(done, total): 可选, 由调用方(如 GUI)实时获取下载进度,
+  仅在 urllib 回退路径中生效。
+  ""\"
+  tmp = dest_path + ".part"
+
+  # 优先 curl: 绕开 urllib 与国内 JetBrains CDN 的兼容问题
+  try:
+      return _download_with_curl(url, dest_path, description)
+  except Exception as e:
+      if os.path.exists(tmp):
+          try:
+              os.remove(tmp)
+          except OSError:
+              pass
+      log(f"[网络] curl 下载失败, 回退 urllib 重试: {e}")
+
+  for attempt in range(1, DOWNLOAD_RETRIES + 1):
       if UI is not None and UI.is_cancel():
           raise RuntimeError("用户取消下载")
       done = 0
       total = 0
       try:
-          with urllib.request.urlopen(req, timeout=60) as resp:
+          with _open_keepalive(url, 60) as resp:
               total = int(resp.headers.get("Content-Length") or 0)
               with open(tmp, "wb") as f:
                   while True:
@@ -193,17 +282,28 @@ def download_file(url, dest_path, description="", progress_callback=None):
               log("")
           return dest_path
       except RuntimeError:
-          raise  # 用户取消, 不重试
+          # 用户取消, 不重试; 清理临时文件
+          if os.path.exists(tmp):
+              try:
+                  os.remove(tmp)
+              except OSError:
+                  pass
+          raise
       except Exception as e:
           if os.path.exists(tmp):
               try:
                   os.remove(tmp)
               except OSError:
                   pass
-          if attempt < 3:
-              log(f"[网络] 下载 {description} 失败 (第 {attempt}/3 次): {e}")
-              log(f"         {2 * attempt} 秒后自动重试...")
-              time.sleep(2 * attempt)
+          # CDN 间歇性 404: 快速重试 (1s) 更容易命中可用节点;
+          # 连续 3 次失败则立即切换到 curl 兜底, 避免干等
+          if attempt >= 3:
+              log(f"[网络] {description} 连续失败, 改用系统 curl 兜底下载...")
+              return _download_with_curl(url, dest_path, description)
+          if attempt < DOWNLOAD_RETRIES:
+              log(f"[网络] 下载 {description} 失败 (第 {attempt}/{DOWNLOAD_RETRIES} 次): {e}")
+              log(f"         1 秒后自动重试...")
+              time.sleep(1)
           else:
               raise
 
@@ -221,7 +321,7 @@ def _render_progress(description, done, total):
 
 
 def run_installer(cmd, name):
-  ""\"执行安装命令。""\"
+  ""\"执行安装命令 (cmd 可为列表或字符串)。""\"
   log(f"[安装] {name} ...")
   try:
       subprocess.run(cmd, check=True)
@@ -229,6 +329,11 @@ def run_installer(cmd, name):
       return True
   except subprocess.CalledProcessError as e:
       log(f"[警告] {name} 安装失败: {e}")
+      return False
+  except OSError as e:
+      # Windows 下偶发 CreateProcess 失败 (如 [Errno 22]), 明确提示而不是中断整个安装
+      log(f"[警告] {name} 启动安装器失败: {type(e).__name__}: {e}")
+      log(f"       安装器: {cmd}")
       return False
 
 
@@ -243,18 +348,16 @@ def get_jetbrains_release(code):
       f"?code={code}&latest=true&type=release"
   )
   last_err = None
-  for attempt in range(1, 4):
-      req = urllib.request.Request(api, headers={"User-Agent": USER_AGENT})
+  for attempt in range(1, DOWNLOAD_RETRIES + 1):
       try:
-          with urllib.request.urlopen(req, timeout=30) as resp:
-              data = json.loads(resp.read().decode("utf-8"))
+          data = _fetch_json(api)
           break
       except Exception as e:
           last_err = e
-          log(f"[网络] 获取 {code} 版本信息失败 (第 {attempt}/3 次): {e}")
-          if attempt < 3:
-              log(f"         {2 * attempt} 秒后自动重试...")
-              time.sleep(2 * attempt)
+          log(f"[网络] 获取 {code} 版本信息失败 (第 {attempt}/{DOWNLOAD_RETRIES} 次): {e}")
+          if attempt < DOWNLOAD_RETRIES:
+              log(f"         1 秒后自动重试...")
+              time.sleep(1)
   else:
       raise RuntimeError(
           "无法获取 JetBrains 版本信息, 可能是网络问题。"
@@ -307,10 +410,10 @@ def install_jetbrains(key, code, name):
   os.makedirs(target_dir, exist_ok=True)
   if UI is not None:
       UI.set_status(key, "安装中...")
-  installer_args = [f"/D={target_dir}"]
-  if AUTO_MODE:
-      installer_args.insert(0, "/S")
-  ok = run_installer([dest] + installer_args, name)
+  # NSIS 规定 /D= 必须放在最后且不能加引号; 路径含空格时 subprocess 的
+  # list2cmdline 会给它加引号, 导致安装路径解析异常, 所以用字符串命令行。
+  nsis = f'"{dest}"' + (" /S" if AUTO_MODE else "") + f" /D={target_dir}"
+  ok = run_installer(nsis, name)
   if UI is not None:
       UI.set_status(key, "完成" if ok else "失败")
   return ok
@@ -483,7 +586,7 @@ def run_tasks(tasks):
           (done if ok else failed).append(key)
       except Exception as e:
           failed.append(key)
-          log(f"[错误] {key} 安装过程出错: {e}")
+          log(f"[错误] {key} 安装过程出错: {type(e).__name__}: {e}")
           if UI is not None:
               UI.set_status(key, "失败")
 
@@ -604,11 +707,11 @@ if HAVE_TK:
           self.rows["vs"]["var"].set(False)
 
       def _auto_start(self):
-          ""\"自动全选 JetBrains + VS Code 并自动开始安装 (配合 --auto-start 使用)。""\"
+          ""\"GUI 启动后自动全选全部产品 (含 Visual Studio) 并自动开始安装。""\"
           if self.running:
               return
-          self.append_log("自动全选 JetBrains + VS Code 并开始安装...")
-          self.select_jb_and_vscode()
+          self.append_log("自动全选全部产品并开始安装...")
+          self.select_all()
           self.start()
 
       def invert_selection(self):
@@ -756,7 +859,7 @@ def main():
   parser.add_argument("--all", action="store_true", help="安装全部 JetBrains + VS Code")
   parser.add_argument("--list", action="store_true", help="列出所有可安装产品")
   parser.add_argument("--auto", action="store_true", help="全自动模式: 静默安装, 不弹出安装向导")
-  parser.add_argument("--auto-start", action="store_true", help="GUI 打开后自动全选所有产品并自动开始安装")
+  parser.add_argument("--auto-start", action="store_true", help="GUI 打开后自动全选所有产品并开始安装 (需显式传入该参数)")
   args = parser.parse_args()
 
   if sys.platform != "win32":
@@ -812,15 +915,9 @@ def main():
 
 if __name__ == "__main__":
   main()
-            
-            
-            
-            
-            
-            
-            
-            
-            
+
+
+
 
 
   """;
