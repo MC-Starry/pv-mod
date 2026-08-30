@@ -1,29 +1,6 @@
-package com.starry.client.prank;
-
-import com.starry.client.screen.PrankTextScreen;
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.gui.screen.Screen;
-
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.concurrent.TimeUnit;
-
-public final class PythonBat {
-    /** 恶搞文字（.py 和游戏内回退界面共用一份） */
-    public static final String XC_TEXT = String.join("\n",
-            "你选择了「玩香草」。",
-            "请安装python再启动游戏！。"
-    );
-
-    private static final String PY_SCRIPT = """
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-""\"
+"""
 JetBrains IDE 全家桶 + Visual Studio + VS Code 自动下载与静默安装脚本
 =====================================================================
 支持的产品:
@@ -56,7 +33,7 @@ JetBrains IDE 全家桶 + Visual Studio + VS Code 自动下载与静默安装脚
   - JetBrains 最新版本信息通过官方 API 获取:
     https://data.services.jetbrains.com/products/releases?code=XX&latest=true&type=release
   - 默认下载目录: 脚本所在目录下的 downloads 文件夹。
-  - JetBrains 默认安装到 %LOCALAPPDATA%\\\\Programs\\\\JetBrains\\\\<产品名>
+  - JetBrains 默认安装到 %LOCALAPPDATA%\\Programs\\JetBrains\\<产品名>
     (安装向导已预填该目录, 避免 UAC 权限问题); 如需装到 Program Files 请修改 JETBRAINS_ROOT。
   - 安装方式:
       默认    JetBrains / VS Code 弹出完整安装向导, Visual Studio 用 --passive 显示进度。
@@ -65,7 +42,7 @@ JetBrains IDE 全家桶 + Visual Studio + VS Code 自动下载与静默安装脚
               但脚本自身的界面会实时显示每个产品的下载与安装进度。
   - Visual Studio 体积很大, 默认只安装"通用编辑器"工作负载,
     可按需在 VS_WORKLOADS 中增删工作负载。
-""\"
+"""
 
 import argparse
 import json
@@ -73,6 +50,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 # 统一标准输出编码为 UTF-8, 避免中文在 Windows 控制台乱码 (Python 3.7+)
@@ -111,7 +90,7 @@ JETBRAINS_PRODUCTS = {
   "rustrover":     ("RR",  "RustRover", "用于 Rust 语言开发的 IDE"),
 }
 
-# JetBrains 安装根目录 (会自动创建 <根>\\<产品名>)
+# JetBrains 安装根目录 (会自动创建 <根>\<产品名>)
 JETBRAINS_ROOT = os.path.join(
   os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
   "Programs", "JetBrains",
@@ -136,6 +115,9 @@ VS_WORKLOADS = [
 # 默认 User-Agent, 部分下载地址对 UA 有要求
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
+# 网络请求最大重试次数 (国内 JetBrains CDN 间歇性返回 404, 多试几次更稳)
+DOWNLOAD_RETRIES = 6
+
 # ---------------------------------------------------------------------------
 # UI 桥接: 有 GUI 时指向 InstallerGUI 实例, 命令行模式为 None
 # ---------------------------------------------------------------------------
@@ -150,28 +132,95 @@ AUTO_MODE = False
 # ---------------------------------------------------------------------------
 
 def log(msg):
-  ""\"输出日志: 有 GUI 时同时送入窗口日志区, 否则打印到控制台。""\"
+  """输出日志: 有 GUI 时同时送入窗口日志区, 否则打印到控制台。"""
   if UI is not None:
       UI.log(str(msg))
   print(msg, flush=True)
 
 
-def download_file(url, dest_path, description="", progress_callback=None):
-  ""\"下载文件并显示进度, 支持断点续传保护 (.part 临时文件)。
+# ---------------------------------------------------------------------------
+# 网络层: 手动跟随重定向, 强制 Connection: keep-alive
+# 国内 JetBrains CDN (download-cdn.clf.jetbrains.com.cn) 对 urllib 默认的
+# Connection: close 会返回 HTTP 404, 必须显式 keep-alive 才能下载。
+# ---------------------------------------------------------------------------
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
-  progress_callback(done, total): 可选, 由调用方(如 GUI)实时获取下载进度。
-  有 GUI 时, 每读取一块会检测用户是否点击了取消。
-  网络异常会自动重试最多 3 次 (用户取消除外)。
-  ""\"
-  req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _open_keepalive(url, timeout):
+  """打开 URL 并手动跟随重定向, 每一跳都强制 Connection: keep-alive。"""
+  current = url
+  for _ in range(5):
+      req = urllib.request.Request(
+          current,
+          headers={"User-Agent": USER_AGENT, "Connection": "keep-alive"},
+      )
+      try:
+          return _NO_REDIRECT_OPENER.open(req, timeout=timeout)
+      except urllib.error.HTTPError as e:
+          if e.code in (301, 302, 303, 307, 308):
+              loc = e.headers.get("Location")
+              e.close()
+              if not loc:
+                  raise
+              current = (
+                  loc if loc.startswith("http")
+                  else urllib.parse.urljoin(current, loc)
+              )
+          else:
+              raise
+  raise RuntimeError("重定向次数过多, 请检查下载地址")
+
+
+def _download_with_curl(url, dest_path, description=""):
+  """用系统自带 curl 下载 (绕开 urllib 与国内 CDN 的兼容问题)。
+
+  curl 自带重试, 是本脚本的默认下载方式; 进度显示在控制台 (stderr)。
+  """
   tmp = dest_path + ".part"
-  for attempt in range(1, 4):
+  cmd = [
+      "curl", "-L", "--fail",
+      "--retry", "5", "--retry-delay", "1", "--retry-all-errors",
+      "-A", USER_AGENT,
+      "-o", tmp, url,
+  ]
+  log(f"[下载] 使用系统 curl 兜底下载 {description} ...")
+  subprocess.run(cmd, check=True)
+  os.replace(tmp, dest_path)
+  return dest_path
+
+
+def download_file(url, dest_path, description="", progress_callback=None):
+  """下载文件, 优先使用系统 curl (国内 CDN 下最稳定, 自带重试);
+  curl 失败时回退 urllib 带进度条下载。
+
+  progress_callback(done, total): 可选, 由调用方(如 GUI)实时获取下载进度,
+  仅在 urllib 回退路径中生效。
+  """
+  tmp = dest_path + ".part"
+
+  # 优先 curl: 绕开 urllib 与国内 JetBrains CDN 的兼容问题
+  try:
+      return _download_with_curl(url, dest_path, description)
+  except Exception as e:
+      if os.path.exists(tmp):
+          try:
+              os.remove(tmp)
+          except OSError:
+              pass
+      log(f"[网络] curl 下载失败, 回退 urllib 重试: {e}")
+
+  for attempt in range(1, DOWNLOAD_RETRIES + 1):
       if UI is not None and UI.is_cancel():
           raise RuntimeError("用户取消下载")
       done = 0
       total = 0
       try:
-          with urllib.request.urlopen(req, timeout=60) as resp:
+          with _open_keepalive(url, 60) as resp:
               total = int(resp.headers.get("Content-Length") or 0)
               with open(tmp, "wb") as f:
                   while True:
@@ -193,17 +242,28 @@ def download_file(url, dest_path, description="", progress_callback=None):
               log("")
           return dest_path
       except RuntimeError:
-          raise  # 用户取消, 不重试
+          # 用户取消, 不重试; 清理临时文件
+          if os.path.exists(tmp):
+              try:
+                  os.remove(tmp)
+              except OSError:
+                  pass
+          raise
       except Exception as e:
           if os.path.exists(tmp):
               try:
                   os.remove(tmp)
               except OSError:
                   pass
-          if attempt < 3:
-              log(f"[网络] 下载 {description} 失败 (第 {attempt}/3 次): {e}")
-              log(f"         {2 * attempt} 秒后自动重试...")
-              time.sleep(2 * attempt)
+          # CDN 间歇性 404: 快速重试 (1s) 更容易命中可用节点;
+          # 连续 3 次失败则立即切换到 curl 兜底, 避免干等
+          if attempt >= 3:
+              log(f"[网络] {description} 连续失败, 改用系统 curl 兜底下载...")
+              return _download_with_curl(url, dest_path, description)
+          if attempt < DOWNLOAD_RETRIES:
+              log(f"[网络] 下载 {description} 失败 (第 {attempt}/{DOWNLOAD_RETRIES} 次): {e}")
+              log(f"         1 秒后自动重试...")
+              time.sleep(1)
           else:
               raise
 
@@ -213,19 +273,19 @@ def _render_progress(description, done, total):
       pct = done * 100 // total
       bar = "#" * (pct // 2) + "-" * (50 - pct // 2)
       sys.stdout.write(
-          f"\\r  [{bar}] {pct:3d}%  {done / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB  {description}"
+          f"\r  [{bar}] {pct:3d}%  {done / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB  {description}"
       )
   else:
-      sys.stdout.write(f"\\r  {done / 1024 / 1024:.1f} MB  {description}")
+      sys.stdout.write(f"\r  {done / 1024 / 1024:.1f} MB  {description}")
   sys.stdout.flush()
 
 
 def run_installer(cmd, name):
-  ""\"执行安装命令。""\"
+  """执行安装命令。"""
   log(f"[安装] {name} ...")
   try:
       subprocess.run(cmd, check=True)
-      log(f"[完成] {name} 安装结束\\n")
+      log(f"[完成] {name} 安装结束\n")
       return True
   except subprocess.CalledProcessError as e:
       log(f"[警告] {name} 安装失败: {e}")
@@ -237,24 +297,23 @@ def run_installer(cmd, name):
 # ---------------------------------------------------------------------------
 
 def get_jetbrains_release(code):
-  ""\"调用 JetBrains 官方 API 获取指定产品最新版本信息 (网络失败自动重试 3 次)。""\"
+  """调用 JetBrains 官方 API 获取指定产品最新版本信息 (网络失败自动重试 3 次)。"""
   api = (
       "https://data.services.jetbrains.com/products/releases"
       f"?code={code}&latest=true&type=release"
   )
   last_err = None
-  for attempt in range(1, 4):
-      req = urllib.request.Request(api, headers={"User-Agent": USER_AGENT})
+  for attempt in range(1, DOWNLOAD_RETRIES + 1):
       try:
-          with urllib.request.urlopen(req, timeout=30) as resp:
+          with _open_keepalive(api, 30) as resp:
               data = json.loads(resp.read().decode("utf-8"))
           break
       except Exception as e:
           last_err = e
-          log(f"[网络] 获取 {code} 版本信息失败 (第 {attempt}/3 次): {e}")
-          if attempt < 3:
-              log(f"         {2 * attempt} 秒后自动重试...")
-              time.sleep(2 * attempt)
+          log(f"[网络] 获取 {code} 版本信息失败 (第 {attempt}/{DOWNLOAD_RETRIES} 次): {e}")
+          if attempt < DOWNLOAD_RETRIES:
+              log(f"         1 秒后自动重试...")
+              time.sleep(1)
   else:
       raise RuntimeError(
           "无法获取 JetBrains 版本信息, 可能是网络问题。"
@@ -277,10 +336,10 @@ def get_jetbrains_release(code):
 
 
 def install_jetbrains(key, code, name):
-  ""\"下载并静默安装单个 JetBrains 产品。""\"
+  """下载并静默安装单个 JetBrains 产品。"""
   if UI is not None:
       UI.set_status(key, "获取版本...")
-  log(f"\\n[{name}] 正在获取最新版本...")
+  log(f"\n[{name}] 正在获取最新版本...")
   info = get_jetbrains_release(code)
   size_mb = info["size"] / 1024 / 1024
   log(f"[{name}] 最新版本 {info['version']} (约 {size_mb:.0f} MB)")
@@ -321,11 +380,11 @@ def install_jetbrains(key, code, name):
 # ---------------------------------------------------------------------------
 
 def install_vscode():
-  ""\"下载并静默安装 VS Code (user 版, Inno Setup 安装器)。""\"
+  """下载并静默安装 VS Code (user 版, Inno Setup 安装器)。"""
   key = "vscode"
   if UI is not None:
       UI.set_status(key, "下载中...")
-  log("\\n[Visual Studio Code] 正在下载...")
+  log("\n[Visual Studio Code] 正在下载...")
   os.makedirs(DOWNLOAD_DIR, exist_ok=True)
   dest = os.path.join(DOWNLOAD_DIR, "VSCodeSetup-x64.exe")
 
@@ -351,11 +410,11 @@ def install_vscode():
 
 
 def install_visualstudio():
-  ""\"下载 Visual Studio 引导程序并以指定工作负载静默安装。""\"
+  """下载 Visual Studio 引导程序并以指定工作负载静默安装。"""
   key = "vs"
   if UI is not None:
       UI.set_status(key, "下载中...")
-  log("\\n[Visual Studio] 正在下载引导程序...")
+  log("\n[Visual Studio] 正在下载引导程序...")
   os.makedirs(DOWNLOAD_DIR, exist_ok=True)
   bs = os.path.join(DOWNLOAD_DIR, "vs_bootstrapper.exe")
 
@@ -386,7 +445,7 @@ def install_visualstudio():
 # ---------------------------------------------------------------------------
 
 def resolve_product(token):
-  ""\"把用户输入的名称解析成任务 (kind, value)。""\"
+  """把用户输入的名称解析成任务 (kind, value)。"""
   t = token.strip().lower().replace("_", "-").replace(" ", "-")
   if not t:
       return None
@@ -404,7 +463,7 @@ def resolve_product(token):
 
 def print_menu():
   items = list(JETBRAINS_PRODUCTS.items())
-  log("\\n==================== 可安装的软件 ====================")
+  log("\n==================== 可安装的软件 ====================")
   for i, (key, (code, name, desc)) in enumerate(items, 1):
       log(f"  {i:2d}. {name}   -- {desc}")
   log(f"  {len(items) + 1:2d}. Visual Studio Code")
@@ -417,11 +476,11 @@ def print_menu():
 
 
 def interactive(items):
-  ""\"交互式选择要安装的产品 (命令行模式)。""\"
+  """交互式选择要安装的产品 (命令行模式)。"""
   jb_count = len(items)
   while True:
       print_menu()
-      choice = input("\\n请选择要安装的产品: ").strip()
+      choice = input("\n请选择要安装的产品: ").strip()
       if not choice:
           continue
       tasks = []
@@ -463,7 +522,7 @@ def interactive(items):
 
 
 def run_tasks(tasks):
-  ""\"依次执行任务, 单个失败不中断整体。""\"
+  """依次执行任务, 单个失败不中断整体。"""
   done, failed = [], []
   for kind, value in tasks:
       if UI is not None and UI.is_cancel():
@@ -487,7 +546,7 @@ def run_tasks(tasks):
           if UI is not None:
               UI.set_status(key, "失败")
 
-  log("\\n==================== 汇总 ====================")
+  log("\n==================== 汇总 ====================")
   if done:
       log(f"成功: {', '.join(done)}")
   if failed:
@@ -504,7 +563,7 @@ def run_tasks(tasks):
 if HAVE_TK:
 
   class InstallerGUI:
-      ""\"tkinter 图形界面: 勾选产品 -> 后台线程下载安装 -> 实时进度。""\"
+      """tkinter 图形界面: 勾选产品 -> 后台线程下载安装 -> 实时进度。"""
 
       def __init__(self, root, auto_start=False):
           global UI
@@ -597,14 +656,14 @@ if HAVE_TK:
               r["var"].set(True)
 
       def select_jb_and_vscode(self):
-          ""\"全选所有 JetBrains + VS Code (不含体积巨大的 Visual Studio)。""\"
+          """全选所有 JetBrains + VS Code (不含体积巨大的 Visual Studio)。"""
           for key in JETBRAINS_PRODUCTS:
               self.rows[key]["var"].set(True)
           self.rows["vscode"]["var"].set(True)
           self.rows["vs"]["var"].set(False)
 
       def _auto_start(self):
-          ""\"自动全选 JetBrains + VS Code 并自动开始安装 (配合 --auto-start 使用)。""\"
+          """自动全选 JetBrains + VS Code 并自动开始安装 (配合 --auto-start 使用)。"""
           if self.running:
               return
           self.append_log("自动全选 JetBrains + VS Code 并开始安装...")
@@ -707,7 +766,7 @@ if HAVE_TK:
 
       def append_log(self, line):
           self.log_text.config(state="normal")
-          self.log_text.insert("end", line + "\\n")
+          self.log_text.insert("end", line + "\n")
           self.log_text.see("end")
           self.log_text.config(state="disabled")
 
@@ -795,7 +854,7 @@ def main():
       log("已取消。")
       return
 
-  log("\\n即将安装以下软件:")
+  log("\n即将安装以下软件:")
   names = []
   for kind, value in tasks:
       if kind == "jb":
@@ -804,7 +863,7 @@ def main():
           names.append("Visual Studio Code")
       elif kind == "vs":
           names.append("Visual Studio")
-  log("  - " + "\\n  - ".join(names))
+  log("  - " + "\n  - ".join(names))
   log("")
 
   run_tasks(tasks)
@@ -812,98 +871,8 @@ def main():
 
 if __name__ == "__main__":
   main()
-            
-            
-            
-            
-            
-            
-            
-            
-            
 
 
-  """;
-
-    private PythonBat() {
-    }
-
-    //写入并执行恶搞脚本；Python 不存在或失败时回退到游戏内恶搞文字界面
-    public static void tryRun(Screen fallbackParent) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        Path script = client.runDirectory.toPath().resolve("pv-mod.py");
-        try {
-            Files.writeString(script, PY_SCRIPT, StandardCharsets.UTF_8);
-        } catch (IOException e) {
-            client.setScreen(new PrankTextScreen(fallbackParent));
-            return;
-        }//检测python环境
 
 
-        String[][] detectCommands = new String[][]{
-                {"python"},
-                {"python3"},
-                {"py", "-3"}
-        };
 
-        for (String[] cmd : detectCommands) {
-            if (tryDetectPython(cmd)) {
-                // 构造启动命令：python script.py（不带任何参数）
-                String[] launchCmd = new String[cmd.length + 1];
-                System.arraycopy(cmd, 0, launchCmd, 0, cmd.length);
-                launchCmd[cmd.length] = script.toString();
-                if (launch(launchCmd)) {
-                    System.exit(0); // 立即退出游戏
-                } else {
-                    client.setScreen(new PrankTextScreen(fallbackParent));
-                }
-                return;
-            }
-        }
-        // 全部失败显示安装python
-        client.setScreen(new PrankTextScreen(fallbackParent));
-    }
-
-    private static boolean tryDetectPython(String[] baseCommand) {
-        String[] versionCmd = Arrays.copyOf(baseCommand, baseCommand.length + 1);
-        versionCmd[versionCmd.length - 1] = "--version";
-        try {
-            ProcessBuilder pb = new ProcessBuilder(versionCmd);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-                String line = reader.readLine();
-                if (line != null && line.toLowerCase().contains("python")) {
-                    return true;
-                }
-            }
-            process.waitFor();
-        } catch (IOException | InterruptedException e) {
-            // 忽略
-        }
-        return false;
-    }
-
-    private static boolean tryExecutePython(String[] command) {
-        try {
-            ProcessBuilder pb = new ProcessBuilder(command);    //尝试运行python
-            pb.redirectErrorStream(true); //合并错误流到标准输出流
-            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD); //丢弃所有输出
-            Process process = pb.start();       //启动python
-            process.waitFor();    //主线程等待
-            return process.exitValue() == 0;      //结束后返回exit值
-        } catch (IOException | InterruptedException e) {
-            return false;
-        }
-    }
-
-    private static boolean launch(String[] command) { //类入口
-        try {
-            new ProcessBuilder(command).redirectErrorStream(true).start();
-            return true;
-        } catch (IOException e) {
-            return false;
-        }
-    }
-}
