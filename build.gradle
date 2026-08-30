@@ -15,7 +15,7 @@ loom {
 	splitEnvironmentSourceSets()
 
 	mods {
-		"pv-mod" {
+		"play-vanilla-mod" {
 			sourceSet sourceSets.main
 			sourceSet sourceSets.client
 		}

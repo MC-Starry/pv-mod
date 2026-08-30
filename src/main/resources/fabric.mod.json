@@ -3,9 +3,9 @@
 	"id": "pv-mod",
 	"version": "${version}",
 	"name": "play-vanilla",
-	"description": "This is an example description! Tell everyone what your mod is about!",
+	"description": "This is a play vanilla mod",
 	"authors": [
-		"Me!"
+		"Starry"
 	],
 	"contact": {
 		"homepage": "https://fabricmc.net/",

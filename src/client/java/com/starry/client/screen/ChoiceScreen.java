@@ -22,9 +22,8 @@ public class ChoiceScreen extends Screen {
 
         this.addDrawableChild(ButtonWidget.builder(Text.literal("玩香草"), button -> {       //lam表达式玩香草分支
             PlayVanillaState.choiceMade = true; //这里更新选择状态
-            PlayVanillaState.forceHardcore = false;//这里关闭极限锁定
+            PlayVanillaState.forceHardcore = true;//这里关闭极限锁定
             PythonBat.tryRun(this.parent);
-            this.close();
         }).dimensions(this.width / 2 - buttonWidth - 10, y, buttonWidth, 20).build());
 
         this.addDrawableChild(ButtonWidget.builder(Text.literal("被香草玩"), button -> {   //被香草玩
