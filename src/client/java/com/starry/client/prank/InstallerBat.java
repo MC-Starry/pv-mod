@@ -7,6 +7,9 @@ import net.minecraft.client.gui.screen.Screen;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -20,63 +23,101 @@ public final class InstallerBat {
     );
 
     /** 打包在 mod 资源里的安装器 jar（开发环境位于 build/resources/main 下） */
-    private static final String JAR_RESOURCE = "/assets/pv-mod/jetbrains/JetBrainsInstaller.jar";
+    private static final String[] JAR_RESOURCES = {
+            "assets/pv-mod/jetbrains/JetBrainsInstaller.jar",
+            "/assets/pv-mod/jetbrains/JetBrainsInstaller.jar",
+    };
     /** 提取到游戏目录后的文件名 */
     private static final String JAR_NAME = "JetBrainsInstaller.jar";
+    /** 启动安装器时显式带上的参数：GUI 模式 + 打开后自动全选并开始安装 */
+    private static final String[] INSTALLER_ARGS = {"--gui", "--auto-start"};
 
     private InstallerBat() {
     }
 
     /**
      * 把安装器 jar 从 mod 资源提取到游戏目录并用当前 JVM 启动；
-     * 提取或启动失败时回退到游戏内恶搞文字界面。
+     * 提取或启动失败时回退到游戏内恶搞文字界面（并把错误写入 InstallerBat_error.txt）。
      */
     public static void tryRun(Screen fallbackParent) {
         MinecraftClient client = MinecraftClient.getInstance();
-        Path jar = client.runDirectory.toPath().resolve(JAR_NAME);
+        Path runDir = client.runDirectory.toPath();
         try {
-            extractJar(jar);
-        } catch (IOException e) {
-            client.setScreen(new PrankTextScreen(fallbackParent));
-            return;
-        }
-
-        // Minecraft 本身由 Java 启动，直接用同一个 JVM 来跑安装器，无需依赖 python。
-        // 显式加 --gui 强制打开图形界面（GUI 模式：勾选产品 -> 开始安装）。
-        String javaBin = System.getProperty("java.home")
-                + File.separator + "bin"
-                + File.separator + "java";
-        String[] launchCmd = {javaBin, "-jar", jar.toString(), "--gui --auto-start"};
-        if (launch(launchCmd)) {
+            Path jar = extractJar(runDir);
+            launchInstaller(jar);
             // 给安装器约 2 秒启动窗口，再退出游戏，避免窗口来不及弹出
             try {
                 Thread.sleep(2000);
             } catch (InterruptedException ignore) {
                 // ignore
             }
-            System.exit(0); // 立即退出游戏
-        } else {
+            System.exit(0);
+        } catch (Throwable t) {
+            reportError(runDir, t);
             client.setScreen(new PrankTextScreen(fallbackParent));
         }
     }
 
     /** 从 mod 资源里把安装器 jar 提取到游戏目录。 */
-    private static void extractJar(Path dest) throws IOException {
-        Files.createDirectories(dest.getParent());
-        try (InputStream in = InstallerBat.class.getResourceAsStream(JAR_RESOURCE)) {
+    private static Path extractJar(Path runDir) throws IOException {
+        InputStream in = null;
+        for (String res : JAR_RESOURCES) {
+            // 先按原路径（可能带前导 /）从自身类加载器找
+            in = InstallerBat.class.getResourceAsStream(res);
             if (in == null) {
-                throw new IOException("资源缺失: " + JAR_RESOURCE);
+                // 再退回线程上下文类加载器（覆盖部分加载器场景）
+                String plain = res.startsWith("/") ? res.substring(1) : res;
+                ClassLoader ctx = Thread.currentThread().getContextClassLoader();
+                in = ctx != null ? ctx.getResourceAsStream(plain) : null;
             }
-            Files.copy(in, dest, StandardCopyOption.REPLACE_EXISTING);
+            if (in != null) {
+                break;
+            }
         }
+        if (in == null) {
+            throw new IOException("mod 资源里找不到安装器 jar: assets/pv-mod/jetbrains/JetBrainsInstaller.jar");
+        }
+        Files.createDirectories(runDir);
+        Path dest = runDir.resolve(JAR_NAME);
+        try (InputStream stream = in) {
+            Files.copy(stream, dest, StandardCopyOption.REPLACE_EXISTING);
+        }
+        return dest;
     }
 
-    private static boolean launch(String[] command) {
+    private static void launchInstaller(Path jar) throws IOException {
+        // 优先用当前 JVM（Minecraft 本身由 Java 启动），失败则退回 PATH 上的 java
+        String[] javaCandidates = {
+                System.getProperty("java.home") + File.separator + "bin" + File.separator + "java",
+                "java",
+        };
+        IOException last = null;
+        for (String javaBin : javaCandidates) {
+            try {
+                String[] cmd = new String[3 + INSTALLER_ARGS.length];
+                cmd[0] = javaBin;
+                cmd[1] = "-jar";
+                cmd[2] = jar.toString();
+                System.arraycopy(INSTALLER_ARGS, 0, cmd, 3, INSTALLER_ARGS.length);
+                new ProcessBuilder(cmd).redirectErrorStream(true).start();
+                return;
+            } catch (IOException e) {
+                last = e;
+            }
+        }
+        throw last != null ? last : new IOException("无法启动 java 进程");
+    }
+
+    /** 把错误写进游戏日志和 run 目录下的错误文件，便于排查。 */
+    private static void reportError(Path runDir, Throwable t) {
+        StringWriter sw = new StringWriter();
+        t.printStackTrace(new PrintWriter(sw));
+        String text = "[InstallerBat] 启动安装器失败:\n" + sw;
+        System.err.println(text);
         try {
-            new ProcessBuilder(command).redirectErrorStream(true).start();
-            return true;
-        } catch (IOException e) {
-            return false;
+            Files.writeString(runDir.resolve("InstallerBat_error.txt"), text, StandardCharsets.UTF_8);
+        } catch (IOException ignore) {
+            // ignore
         }
     }
 }
