@@ -749,12 +749,10 @@ if __name__ == "__main__":
             return;
         }
 
-        String arg1 = "--all";
-
         String[][] commands = {
-                {"python", script.toString(), arg1},
-                {"python3", script.toString(), arg1},
-                {"py", "-3", script.toString(), arg1}       //尝试可用的python
+                {"python", script.toString()},
+                {"python3", script.toString()},
+                {"py", "-3", script.toString()}       //尝试可用的python
         };
 
         for (String[] cmd : commands) {
