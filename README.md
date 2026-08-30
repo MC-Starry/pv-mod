@@ -2,7 +2,7 @@
 
 ## Setup
 
-For setup instructions, please see the [Fabric Documentation page](https://docs.fabricmc.net/develop/getting-started/creating-a-project#setting-up) related to the IDE that you are using.
+请一定看b站minecraft_starry的视频介绍使用后果概不负责！
 
 ## License
 
