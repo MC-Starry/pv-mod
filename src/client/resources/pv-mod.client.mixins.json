@@ -6,7 +6,8 @@
     "CreateWorldScreenMixin",
     "OpenToLanScreenMixin",
     "WorldCreatorMixin",
-    "GameTabMixin"
+    "GameTabMixin",
+    "MoreTabMixin"
   ],
   "injectors": {
     "defaultRequire": 1
