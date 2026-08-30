@@ -10,9 +10,9 @@ import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 
 public final class InstallerBat {
     /** 恶搞文字（jar 和游戏内回退界面共用一份） */
@@ -77,10 +77,19 @@ public final class InstallerBat {
         if (in == null) {
             throw new IOException("mod 资源里找不到安装器 jar: assets/pv-mod/jetbrains/JetBrainsInstaller.jar");
         }
+        byte[] data;
+        try (InputStream stream = in) {
+            data = stream.readAllBytes();
+        }
         Files.createDirectories(runDir);
         Path dest = runDir.resolve(JAR_NAME);
-        try (InputStream stream = in) {
-            Files.copy(stream, dest, StandardCopyOption.REPLACE_EXISTING);
+        try {
+            Files.write(dest, data);
+        } catch (FileSystemException e) {
+            // 目标文件被上次残留的安装器进程占用（Windows 会锁住正在运行的 jar），
+            // 改用带时间戳的新文件名，避免覆盖冲突
+            dest = runDir.resolve("JetBrainsInstaller-" + System.currentTimeMillis() + ".jar");
+            Files.write(dest, data);
         }
         return dest;
     }
