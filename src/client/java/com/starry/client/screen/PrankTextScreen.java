@@ -10,7 +10,7 @@ public class PrankTextScreen extends Screen {
     private final Screen parent;
 
     public PrankTextScreen(Screen parent) {
-        super(Text.literal("想被香草玩吗？"));
+        super(Text.literal("想玩香草吗？"));
         this.parent = parent;
     }
 

@@ -11,7 +11,7 @@ public class ChoiceScreen extends Screen {
     private final Screen parent; //注册
 
     public ChoiceScreen(Screen parent) {
-        super(Text.literal("玩香草还是被香草玩？"));//选择文本
+        super(Text.literal("玩香草还是被香草玩？（请确保一定在b站看了minecraft_Starry的模组介绍，本人不承担选择后果！）"));//选择文本
         this.parent = parent;
     }
 
